@@ -1,13 +1,14 @@
 P4C ?= p4c-bm2-ss
 P4CFLAGS ?=
 PYTHON ?= python3
+SUDO ?= sudo
 
 BUILD_DIR := build
 P4_SOURCE := p4/mpls.p4
 BMV2_JSON := $(BUILD_DIR)/mpls.json
 P4INFO := $(BUILD_DIR)/mpls.p4info.txtpb
 
-.PHONY: build p4 test clean
+.PHONY: build p4 test topology clean
 
 build: p4
 
@@ -15,6 +16,10 @@ p4: $(BMV2_JSON) $(P4INFO)
 
 test: build
 	$(PYTHON) -B tests/test_pipeline.py $(BMV2_JSON) $(P4INFO)
+	$(SUDO) $(PYTHON) -B tests/test_topology.py
+
+topology: build
+	$(SUDO) $(PYTHON) -B mininet/topology.py
 
 $(BMV2_JSON) $(P4INFO) &: $(P4_SOURCE)
 	mkdir -p $(BUILD_DIR)
