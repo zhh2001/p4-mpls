@@ -11,7 +11,7 @@ P4INFO := $(BUILD_DIR)/mpls.p4info.txtpb
 CONTROLLER := $(BUILD_DIR)/mpls-controller
 CONTROLLER_SOURCES := $(wildcard controller/*.go)
 
-.PHONY: build p4 controller test topology clean
+.PHONY: build p4 controller test run topology clean
 
 build: p4 controller
 
@@ -28,6 +28,10 @@ test: build
 
 topology: build
 	$(SUDO) $(PYTHON) -B mininet/topology.py
+
+run: build
+	$(SUDO) $(PYTHON) -B mininet/topology.py \
+		--controller $(CONTROLLER) --device-config $(BMV2_JSON) --p4info $(P4INFO)
 
 $(BMV2_JSON) $(P4INFO) &: $(P4_SOURCE)
 	mkdir -p $(BUILD_DIR)

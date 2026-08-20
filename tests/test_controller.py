@@ -12,11 +12,13 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "mininet"))
 
 from topology import (
+    HOST_CONFIG,
     SWITCH_CONFIG,
     configure_network,
     create_network,
     port_is_open,
     request_termination,
+    run_controller as run_topology_controller,
     stop_network,
     wait_for_switches,
 )
@@ -66,7 +68,7 @@ def wait_for_cleanup(processes, shells, interfaces, ports, timeout=5):
     raise AssertionError("controller/Mininet/BMv2 resources were not fully cleaned up")
 
 
-def run_controller(controller, device_config, p4info, extra_args, processes):
+def execute_controller(controller, device_config, p4info, extra_args, processes):
     with defer_termination():
         process = subprocess.Popen(
             [
@@ -94,6 +96,57 @@ def run_controller(controller, device_config, p4info, extra_args, processes):
     return process.returncode, output.splitlines(), error_output
 
 
+def run_ping(network, source_name, target_name, identifier, processes):
+    source = network.get(source_name)
+    target_ip = HOST_CONFIG[target_name]["ip"].partition("/")[0]
+    with defer_termination():
+        process = source.popen(
+            [
+                "env",
+                "LC_ALL=C",
+                "ping",
+                "-4",
+                "-n",
+                "-q",
+                "-c",
+                "3",
+                "-i",
+                "0.1",
+                "-W",
+                "1",
+                "-I",
+                source.defaultIntf().name,
+                "-e",
+                str(identifier),
+                target_ip,
+            ],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+        )
+        processes.append(process)
+    try:
+        output, _ = process.communicate(timeout=3)
+    except subprocess.TimeoutExpired as error:
+        stop_process(process)
+        raise AssertionError(f"{source_name} to {target_name} ping timed out") from error
+
+    summary = "3 packets transmitted, 3 received, 0% packet loss"
+    require(
+        process.returncode == 0,
+        f"{source_name} to {target_name} failed: {output.strip()}",
+    )
+    require(
+        summary in output,
+        f"{source_name} to {target_name} was incomplete: {output.strip()}",
+    )
+    require(
+        "duplicate" not in output.lower(),
+        f"{source_name} to {target_name} duplicated packets",
+    )
+
+
 def run_test(controller, device_config, p4info):
     ports = [
         port
@@ -108,13 +161,14 @@ def run_test(controller, device_config, p4info):
             intf.name for link in network.links for intf in (link.intf1, link.intf2)
         ]
         controller_processes = []
+        probe_processes = []
 
         try:
             network.start()
             configure_network(network)
             wait_for_switches(network)
 
-            returncode, output, error_output = run_controller(
+            returncode, output, error_output = execute_controller(
                 controller,
                 device_config,
                 p4info,
@@ -128,17 +182,16 @@ def run_test(controller, device_config, p4info):
                 f"unclear incomplete-configuration error: {error_output!r}",
             )
 
-            returncode, configured, error_output = run_controller(
+            configured = run_topology_controller(
                 controller,
                 device_config,
                 p4info,
-                ["--election-id", "2"],
-                controller_processes,
+                election_id=2,
+                controller_timeout=20,
+                process_timeout=30,
             )
-            require(returncode == 0, f"controller failed: {error_output.strip()}")
-            require(not error_output, f"unexpected controller stderr: {error_output}")
             require(
-                configured
+                configured.splitlines()
                 == [
                     "s1: pipeline and 2 entries verified",
                     "s2: pipeline and 2 entries verified",
@@ -149,7 +202,7 @@ def run_test(controller, device_config, p4info):
                 f"unexpected controller output: {configured!r}",
             )
 
-            returncode, verified, error_output = run_controller(
+            returncode, verified, error_output = execute_controller(
                 controller,
                 device_config,
                 p4info,
@@ -170,6 +223,9 @@ def run_test(controller, device_config, p4info):
                 f"unexpected verification output: {verified!r}",
             )
 
+            run_ping(network, "h1", "h2", 41001, probe_processes)
+            run_ping(network, "h2", "h1", 42002, probe_processes)
+
             for switch in network.switches:
                 require(
                     switch.process.poll() is None,
@@ -182,12 +238,16 @@ def run_test(controller, device_config, p4info):
         finally:
             with defer_termination():
                 cleanup_failures = []
-                for process in controller_processes:
-                    try:
-                        stop_process(process)
-                    except BaseException as error:
-                        cleanup_failures.append(f"controller stop: {error}")
-                processes = [*controller_processes]
+                for role, processes_to_stop in (
+                    ("probe", probe_processes),
+                    ("controller", controller_processes),
+                ):
+                    for process in processes_to_stop:
+                        try:
+                            stop_process(process)
+                        except BaseException as error:
+                            cleanup_failures.append(f"{role} stop: {error}")
+                processes = [*probe_processes, *controller_processes]
                 processes.extend(switch.process for switch in network.switches)
                 cleanup_failures.extend(stop_network(network))
                 try:
@@ -202,7 +262,7 @@ def run_test(controller, device_config, p4info):
         require(runtime_path.exists(), "runtime directory disappeared too early")
 
     require(not runtime_path.exists(), "runtime directory was not removed")
-    print("controller integration: PASS")
+    print("controller and forwarding smoke: PASS")
 
 
 def main():

@@ -1,4 +1,5 @@
 import argparse
+import math
 import os
 import signal
 import shutil
@@ -16,6 +17,8 @@ from mininet.topo import Topo
 
 
 ROOT = Path(__file__).resolve().parents[1]
+TERMINATION_SIGNALS = (signal.SIGHUP, signal.SIGTERM)
+CHILD_START_SIGNALS = (*TERMINATION_SIGNALS, signal.SIGINT)
 
 HOST_CONFIG = {
     "h1": {
@@ -361,6 +364,105 @@ def wait_for_switches(network, timeout=5):
     raise TimeoutError("BMv2 runtime endpoints did not become ready")
 
 
+def stop_process(process):
+    if process is None or process.poll() is not None:
+        return
+    process.terminate()
+    try:
+        process.wait(timeout=3)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.wait(timeout=3)
+
+
+def run_controller(
+    controller,
+    device_config,
+    p4info,
+    election_id=1,
+    controller_timeout=20,
+    process_timeout=30,
+):
+    controller, device_config, p4info = validate_controller_run(
+        controller,
+        device_config,
+        p4info,
+        election_id,
+        controller_timeout,
+        process_timeout,
+    )
+
+    command = [
+        str(controller),
+        "--device-config",
+        str(device_config),
+        "--p4info",
+        str(p4info),
+        "--election-id",
+        str(election_id),
+        "--timeout",
+        f"{controller_timeout:g}s",
+    ]
+    process = None
+    try:
+        previous_mask = signal.pthread_sigmask(signal.SIG_BLOCK, CHILD_START_SIGNALS)
+        try:
+            process = subprocess.Popen(
+                command,
+                cwd=ROOT,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+            )
+        finally:
+            signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
+
+        try:
+            output, _ = process.communicate(timeout=process_timeout)
+        except subprocess.TimeoutExpired as error:
+            stop_process(process)
+            raise RuntimeError("controller timed out") from error
+    except BaseException:
+        stop_process(process)
+        raise
+
+    if process.returncode != 0:
+        details = output.strip()
+        raise RuntimeError(f"controller failed with status {process.returncode}: {details}")
+    if output:
+        info(output if output.endswith("\n") else f"{output}\n")
+    return output.strip()
+
+
+def validate_controller_run(
+    controller,
+    device_config,
+    p4info,
+    election_id,
+    controller_timeout,
+    process_timeout,
+):
+    controller = Path(controller).resolve()
+    device_config = Path(device_config).resolve()
+    p4info = Path(p4info).resolve()
+    for path in (controller, device_config, p4info):
+        if not path.is_file():
+            raise RuntimeError(f"required artifact missing: {path}")
+    if not os.access(controller, os.X_OK):
+        raise RuntimeError(f"controller is not executable: {controller}")
+    if election_id <= 0:
+        raise RuntimeError("controller election ID must be positive")
+    if (
+        not math.isfinite(controller_timeout)
+        or not math.isfinite(process_timeout)
+        or controller_timeout <= 0
+        or process_timeout <= controller_timeout
+    ):
+        raise RuntimeError("controller deadlines are invalid")
+    return controller, device_config, p4info
+
+
 def require_root():
     if os.geteuid() != 0:
         raise SystemExit("Mininet must run as root")
@@ -379,13 +481,32 @@ def main():
     parser = argparse.ArgumentParser(description="Run the MPLS Mininet topology")
     parser.add_argument("--bmv2", default="simple_switch_grpc")
     parser.add_argument("--log-dir", type=Path)
+    parser.add_argument("--controller", type=Path)
+    parser.add_argument(
+        "--device-config", type=Path, default=ROOT / "build" / "mpls.json"
+    )
+    parser.add_argument("--p4info", type=Path, default=ROOT / "build" / "mpls.p4info.txtpb")
+    parser.add_argument("--controller-timeout", type=float, default=20)
     args = parser.parse_args()
+
+    if args.controller is not None:
+        try:
+            args.controller, args.device_config, args.p4info = validate_controller_run(
+                args.controller,
+                args.device_config,
+                args.p4info,
+                1,
+                args.controller_timeout,
+                args.controller_timeout + 10,
+            )
+        except RuntimeError as error:
+            parser.error(str(error))
 
     require_root()
     setLogLevel("info")
     previous_handlers = {
         signum: signal.signal(signum, request_termination)
-        for signum in (signal.SIGHUP, signal.SIGTERM)
+        for signum in TERMINATION_SIGNALS
     }
     runtime_dir = None
     if args.log_dir is None:
@@ -402,6 +523,15 @@ def main():
         configure_network(network)
         wait_for_switches(network)
         info("*** P4Runtime endpoints: 127.0.0.1:50051-50054\n")
+        if args.controller is not None:
+            info("*** Programming the P4Runtime pipeline\n")
+            run_controller(
+                args.controller,
+                args.device_config,
+                args.p4info,
+                controller_timeout=args.controller_timeout,
+                process_timeout=args.controller_timeout + 10,
+            )
         CLI(network)
     except TerminationRequested:
         info("\n*** Termination requested\n")
