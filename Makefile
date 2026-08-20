@@ -25,6 +25,7 @@ test: build
 	$(GO) vet ./...
 	$(SUDO) $(PYTHON) -B tests/test_topology.py
 	$(SUDO) $(PYTHON) -B tests/test_controller.py $(CONTROLLER) $(BMV2_JSON) $(P4INFO)
+	$(SUDO) $(PYTHON) -B tests/test_dataplane.py $(CONTROLLER) $(BMV2_JSON) $(P4INFO)
 
 topology: build
 	$(SUDO) $(PYTHON) -B mininet/topology.py

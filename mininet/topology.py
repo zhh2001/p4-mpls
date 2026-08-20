@@ -66,20 +66,27 @@ INTERFACE_NAMES = {
 
 
 def run_in_node(node, *command):
-    process = node.popen(
-        list(command),
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-    )
+    process = None
     try:
+        previous_mask = signal.pthread_sigmask(signal.SIG_BLOCK, CHILD_START_SIGNALS)
+        try:
+            process = node.popen(
+                list(command),
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+            )
+        finally:
+            signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
         output, _ = process.communicate(timeout=3)
     except subprocess.TimeoutExpired as error:
-        process.kill()
-        process.communicate()
+        stop_process(process)
         rendered = " ".join(command)
         raise RuntimeError(f"{node.name}: {rendered} timed out") from error
+    except BaseException:
+        stop_process(process)
+        raise
     if process.returncode != 0:
         rendered = " ".join(command)
         raise RuntimeError(f"{node.name}: {rendered} failed: {output.strip()}")
@@ -152,12 +159,16 @@ class P4RuntimeSwitch(Switch):
         )
 
         self._log_file = self.log_path.open("w", encoding="utf-8")
-        self.process = self.popen(
-            self.command,
-            stdin=subprocess.DEVNULL,
-            stdout=self._log_file,
-            stderr=subprocess.STDOUT,
-        )
+        previous_mask = signal.pthread_sigmask(signal.SIG_BLOCK, CHILD_START_SIGNALS)
+        try:
+            self.process = self.popen(
+                self.command,
+                stdin=subprocess.DEVNULL,
+                stdout=self._log_file,
+                stderr=subprocess.STDOUT,
+            )
+        finally:
+            signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
 
     def stop(self, deleteIntfs=True):
         failures = []
@@ -268,7 +279,108 @@ def stop_network(network):
     return failures
 
 
-def create_network(log_dir=ROOT / "build" / "run", executable="simple_switch_grpc"):
+def direct_child_pids():
+    path = Path(f"/proc/{os.getpid()}/task/{os.getpid()}/children")
+    try:
+        return {int(pid) for pid in path.read_text().split()}
+    except FileNotFoundError:
+        return set()
+
+
+def stop_build_children(baseline, timeout=3):
+    children = direct_child_pids() - baseline
+    for pid in children:
+        try:
+            process_group = os.getpgid(pid)
+            if process_group == pid:
+                os.killpg(process_group, signal.SIGHUP)
+            else:
+                os.kill(pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+
+    deadline = time.monotonic() + timeout
+    while children and time.monotonic() < deadline:
+        for pid in list(children):
+            try:
+                waited, _ = os.waitpid(pid, os.WNOHANG)
+            except ChildProcessError:
+                children.remove(pid)
+                continue
+            if waited == pid:
+                children.remove(pid)
+        if children:
+            time.sleep(0.05)
+
+    for pid in list(children):
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            children.remove(pid)
+    deadline = time.monotonic() + 1
+    while children and time.monotonic() < deadline:
+        for pid in list(children):
+            try:
+                waited, _ = os.waitpid(pid, os.WNOHANG)
+            except ChildProcessError:
+                children.remove(pid)
+                continue
+            if waited == pid:
+                children.remove(pid)
+        if children:
+            time.sleep(0.05)
+    return [f"build child still running: {pid}" for pid in children]
+
+
+def remove_build_interfaces():
+    failures = []
+    ip_command = shutil.which("ip")
+    if ip_command is None:
+        return ["ip executable not found during build cleanup"]
+    for name in sorted(INTERFACE_NAMES):
+        path = Path("/sys/class/net") / name
+        if not path.exists():
+            continue
+        try:
+            result = subprocess.run(
+                [ip_command, "link", "delete", "dev", name],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                timeout=3,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired) as error:
+            failures.append(f"{name} delete: {error}")
+            continue
+        if result.returncode != 0 and path.exists():
+            failures.append(f"{name} delete: {result.stdout.strip()}")
+    return failures
+
+
+def build_network(network):
+    baseline = direct_child_pids()
+    try:
+        network.build()
+    except BaseException as error:
+        previous_mask = signal.pthread_sigmask(signal.SIG_BLOCK, CHILD_START_SIGNALS)
+        try:
+            failures = stop_network(network)
+            failures.extend(stop_build_children(baseline))
+            failures.extend(remove_build_interfaces())
+        finally:
+            signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
+        if failures:
+            details = "; ".join(failures)
+            raise RuntimeError(f"network build cleanup failed: {details}") from error
+        raise
+    return network
+
+
+def create_network(
+    log_dir=ROOT / "build" / "run", executable="simple_switch_grpc", build=True
+):
     preflight(executable)
     topo = MplsTopo(log_dir=Path(log_dir).resolve(), executable=executable)
     network = Mininet(
@@ -278,15 +390,9 @@ def create_network(log_dir=ROOT / "build" / "run", executable="simple_switch_grp
         autoStaticArp=False,
         build=False,
     )
-    try:
-        network.build()
-    except BaseException as error:
-        cleanup_failures = stop_network(network)
-        if cleanup_failures:
-            details = "; ".join(cleanup_failures)
-            raise RuntimeError(f"network build cleanup failed: {details}") from error
-        raise
-    return network
+    if not build:
+        return network
+    return build_network(network)
 
 
 def configure_network(network):
